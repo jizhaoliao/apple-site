@@ -2,20 +2,77 @@
 # docker-compose.yml — 从 GHCR 拉取镜像运行（不本地构建）
 #
 # 用法：
-#   docker compose pull && docker compose up -d
+#   1) 把本文件放到你要的部署目录，例如：
+#        /vol2/1000/docker/apple-site/docker-compose.yml
+#   2) 在**本文件所在目录**执行：
+#        docker compose pull && docker compose up -d
 #
 # 前提：先在 GitHub Actions 里手动触发过构建，镜像已推到 GHCR。
 # ============================================================================
+#
+# 【相对路径约定 — 本文件的关键设计】
+#
+#   volumes 段里宿主机侧一律写 ./xxx 形式，不写任何绝对路径。
+#
+#   `./` 指的是 **docker-compose.yml 自己所在的目录**，
+#   不是当前工作目录，更不是仓库根目录。
+#
+#   因此整个部署目录可以任意搬家：
+#     /vol2/1000/docker/apple-site/   ←→   /vol1/docker/xx/apple-site/
+#   直接 mv 过去就能起，配置一行都不用改。
+#
+#   部署后的目录结构长这样：
+#     /vol2/1000/docker/apple-site/
+#     ├── docker-compose.yml     <- 本文件
+#     ├── data/                  <- 自动创建，容器 /app/data
+#     └── logs/                  <- 自动创建，容器 /app/logs
+#
+#   ⚠️ 首次 up 时若 data/ logs/ 不存在，Docker 会**以 root 身份自动创建**，
+#      属主 root:root、权限 0755。容器进程也是 root（镜像未设 USER），
+#      所以读写正常，不用手工 chown。
+#      但如果你以后想让别的用户写这两个目录，记得先 chown 再起容器。
+# ============================================================================
+#
+# 【关于 version 字段】
+#   按要求写 '3.8'。Docker Compose v2（即现在的 `docker compose` 命令）
+#   已经不需要 version，写了会看到一条警告：
+#     the attribute `version` is obsolete, it will be ignored
+#   这只是提示，**不影响任何功能**。保留是为了兼容老的 docker-compose v1
+#   （v1 缺了这行会直接报错）。
+#
+#   ⚠️ 千万不要退成 version: '2'
+#      version '2' 不是「v2 语法」，而是语义完全不同的另一种 legacy 格式，
+#      会切到旧模式，网络/卷/依赖行为都与 '3' 不同，相对路径写法也会出问题。
+# ============================================================================
+
+version: '3.8'
 
 services:
   wloc-spoofer:
-    # ⚠️ 把下面的 jizhaoliao 换成你的 GitHub 用户名（全小写）。
-    # GHCR 不接受大写仓库名，所以这里必须是小写形式。
+    # ⚠️ 把下面的 jizhaoliao 换成你的 GitHub 用户名（必须全小写）。
+    # GHCR 不接受大写仓库名，大小写不匹配会 404。
     image: ghcr.io/jizhaoliao/apple-site:latest
     container_name: wloc-spoofer
 
     # 每次 up 都检查有没有新镜像；配合 `docker compose pull` 使用
     pull_policy: always
+
+    # ------------------------------------------------------------------------
+    # 目录挂载（相对路径 bind mount）
+    # ------------------------------------------------------------------------
+    # 格式：  <宿主机相对路径>:<容器内绝对路径>
+    #   - 左边必须是相对路径 ./ 开头 —— 这是本文件可迁移的关键
+    #   - 右边必须是绝对路径 —— 容器内不存在「相对」的概念
+    volumes:
+      # 应用数据目录
+      #   宿主机：./data  = docker-compose.yml 同级的 data/
+      #   容器内：/app/data
+      - ./data:/app/data
+
+      # 日志目录
+      #   宿主机：./logs  = docker-compose.yml 同级的 logs/
+      #   容器内：/app/logs
+      - ./logs:/app/logs
 
     ports:
       # 左边是 NAS 上的端口，冲突就改左边，右边别动
@@ -23,7 +80,7 @@ services:
 
     environment:
       PORT: "8787"
-      # "*" = 监听所有网卡（KJ parseAddress 通配写法，同时覆盖 IPv4/IPv6）。
+      # "*" = 监听所有网卡（KJ parseAddress 的通配写法，同时覆盖 IPv4/IPv6）。
       # 别改成 0.0.0.0，那只管 IPv4。
       BIND: "*"
       # 与仓库里的 wrangler.jsonc 保持同步
@@ -36,7 +93,15 @@ services:
 
     restart: unless-stopped
 
-    # 日志轮转：防止长期运行把 NAS 磁盘写满
+    # ------------------------------------------------------------------------
+    # 日志
+    # ------------------------------------------------------------------------
+    # json-file 驱动：日志落在宿主机 /var/lib/docker/containers/<id>/ 下，
+    # 由 dockerd 管理。用 `docker compose logs -f` 查看。
+    #
+    # 注意：上面的 ./logs:/app/logs 挂载**不会**把 docker 日志收进去 ——
+    #      那是容器内应用自己写的文件，和引擎日志是两回事。
+    #      这里配的是引擎侧轮转，防止长期运行把 NAS 磁盘写满。
     logging:
       driver: "json-file"
       options:
