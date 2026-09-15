@@ -102,6 +102,14 @@ WORKDIR /app
 COPY docker/server.mjs ./server.mjs
 COPY --from=builder /build/dist/worker.js ./worker.js
 
+# 预建可挂载目录。
+# 目的：让 docker-compose 里的 ./data:/app/data 和 ./logs:/app/logs
+# 在**镜像层面**就有对应路径。若不预建，Docker 首次 up 时也会自动创建，
+# 但那是「空目录覆盖」—— 万一以后镜像里要放默认数据/配置，会被直接盖掉。
+# 这里显式建好并给足权限，语义更清晰。
+RUN mkdir -p /app/data /app/logs \
+ && chmod 755 /app/data /app/logs
+
 ENV PORT=8787 \
     BIND="*" \
     ENTRY_MODULE=worker.js \
