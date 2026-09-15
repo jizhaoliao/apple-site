@@ -6,12 +6,21 @@
 #   stage 2 (runtime) — 只装 workerd + 那一个 bundle，不带 node_modules
 #
 # 保持上游代码零改动：跑的就是 Cloudflare 上的同一份 src/、同一个 workerd 运行时。
+#
+# ⚠️ 基础镜像必须用 Debian，不能用 Alpine。
+#    workerd 的官方二进制是链接 glibc + libc++ 的，而 Alpine 是 musl libc，
+#    且 Alpine 仓库里没有 libc++ 包。Cloudflare 维护者明确说过 workerd 在
+#    Alpine 上"不容易跑起来"。（见 cloudflare/workerd issue #286）
+#    踩坑记录：用 Alpine 时 npm install 会**成功**（因为平台包没声明 libc 字段，
+#    不会被过滤），但装下来的是跑不了的 glibc 二进制，且 postinstall 的
+#    版本校验失败时只打印警告、不返回非 0 —— 结果就是镜像构建"绿"的、
+#    容器一起来就 `spawn workerd ENOENT`。构建期看不懂，运行期才炸。
 # ============================================================================
 
 # ---------------------------------------------------------------------------
 # stage 1: 构建
 # ---------------------------------------------------------------------------
-FROM node:22-alpine AS builder
+FROM node:22-bookworm-slim AS builder
 
 WORKDIR /build
 
@@ -54,15 +63,38 @@ console.log('[check] bundle 无裸导入，OK');\
 # ---------------------------------------------------------------------------
 # stage 2: 运行
 # ---------------------------------------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:22-bookworm-slim AS runtime
 
-# workerd 由 npm 包分发（自带平台二进制）。
+# ---- 运行时依赖 ----
+# libc++1 / libc++abi1 / libunwind8：workerd 二进制动态链接的 C++ 运行时。
+#   C++ 协程需要 libc++（workerd 大量使用协程），缺了会直接 exec 失败。
+# ca-certificates：workerd 要往 gs-loc.apple.com 发 HTTPS 请求，没证书会握手失败。
+# tini：作为 PID 1 做信号转发 + 收割僵尸进程，配合下面的 ENTRYPOINT 使用。
+# --no-install-recommends 避免拖进无用的推荐包，保持镜像精简。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libc++1 \
+      libc++abi1 \
+      libunwind8 \
+      ca-certificates \
+      tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# workerd 由 npm 包分发（自带平台二进制，在 @cloudflare/workerd-linux-64 里）。
 # 版本策略：锁到 1.2026 这条日期线，允许补丁位浮动。
 #   完全锁死（=x.y.z）最可复现，但 npm 撤包后构建会失败；
 #   完全不锁（latest）某天会因 capnp schema 变更而坏掉。折中处理。
-RUN npm install -g workerd@~1.20260911.1 --no-audit --no-fund \
- && npm cache clean --force \
- && rm -rf /root/.npm /tmp/*
+RUN npm install -g workerd@~1.20260911.1 --no-audit --no-fund
+
+# ⚠️ 构建期自检（这一步是本 Dockerfile 最重要的防线之一）
+# 上面说了，workerd 的 postinstall 在二进制跑不起来时**只警告不报错**，
+# 所以 `npm install` 成功 ≠ 二进制可用。这里主动执行一次 --version，
+# 让平台/依赖错配在构建期就变成红色失败，而不是等到 NAS 上容器起不来。
+RUN workerd --version \
+ && echo "[check] workerd 二进制可执行，OK"
+
+# 清 npm 缓存。注意：必须在 workerd 自检**之后**再清，别把二进制误删。
+RUN npm cache clean --force && rm -rf /root/.npm
 
 WORKDIR /app
 
@@ -78,8 +110,10 @@ ENV PORT=8787 \
 
 EXPOSE 8787
 
-# 健康检查用 node 自带的 fetch，不依赖镜像里有 curl/wget（alpine 默认没有）
+# 健康检查用 node 自带的 fetch，不依赖镜像里有 curl/wget
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+# tini 做 PID 1：正确转发 SIGTERM 给 workerd，docker stop 才能干净退出
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "server.mjs"]
