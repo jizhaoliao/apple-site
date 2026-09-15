@@ -1,0 +1,28 @@
+# 构建上下文排除项 —— 减小上下文体积、避免把无关文件带进镜像
+
+# 依赖与构建产物（镜像里会重新装、重新打）
+node_modules
+dist
+
+# git
+.git
+.gitignore
+
+# 本地生成的 workerd 配置
+docker/workerd.generated.capnp
+
+# CI 与文档
+.github
+
+# 自托管用不到的上游部分
+# （functions/ 走的是 hono/cloudflare-pages 适配器，那是 Pages 专用；
+#   我们走 Worker 直跑，不需要它）
+functions
+test
+wrangler.jsonc
+wrangler.pages.jsonc
+
+# 编辑器
+.vscode
+.idea
+*.log
