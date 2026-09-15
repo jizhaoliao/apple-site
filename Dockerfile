@@ -108,6 +108,28 @@ ENV PORT=8787 \
     COMPATIBILITY_DATE=2026-08-05 \
     NODE_ENV=production
 
+# ⚠️ 构建期第二道自检：预检 capnp 与 embed 路径
+#
+# 踩过的坑：capnp 的 embed 对以 "/" 开头的路径**不当文件系统绝对路径**处理，
+# 而是去 -I 搜索路径（workerd 自带 builtin 目录）里找，于是报
+#   Couldn't read file for embed: /app/worker.js
+# 这类错误只有真跑起来才暴露。这里用 `workerd compile --config-only`
+# 做一次纯解析预检（只解析不启动、不占端口），提前到构建期拦住。
+#
+# 注意 capnp 文件要放在 /app 下，这样 embed "worker.js" 才正好指向
+# /app/worker.js —— 和生产环境完全一致的解析路径。
+RUN printf '%s\n' \
+      'using Workerd = import "/workerd/workerd.capnp";' \
+      'const config :Workerd.Config = (' \
+      '  services = [ ( name = "main", worker = (' \
+      '    modules = [ ( name = "worker.js", esModule = embed "worker.js" ) ],' \
+      '    compatibilityDate = "2026-08-05", ) ) ],' \
+      '  sockets = [ ( name = "http", address = "*:8787", http = (), service = "main" ) ] );' \
+      > /app/check.capnp \
+ && workerd compile /app/check.capnp config --config-only > /app/check.bin \
+ && rm -f /app/check.capnp /app/check.bin \
+ && echo "[check] capnp 解析 + embed 相对路径读取，OK"
+
 EXPOSE 8787
 
 # 健康检查用 node 自带的 fetch，不依赖镜像里有 curl/wget
