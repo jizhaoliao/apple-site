@@ -2,9 +2,9 @@
 // server.mjs — 用官方 workerd 跑我们的 Worker bundle，并对外提供 HTTP 服务。
 //
 // 为什么不直接写 workerd.capnp 静态文件：
-// workerd 的 socket 配置需要绝对路径（disk path / module path），而容器里
-// 工作目录可能变。用脚本在启动时生成 capnp，可以把路径算准，也方便把
-// settings 暴露成环境变量。
+// capnp 里的 embed 路径有讲究（见下方「embed 路径必须用相对路径」那段），
+// 而且容器里路径可能变。用脚本在启动时生成 capnp，可以把路径算准，
+// 也方便把 settings 暴露成环境变量。
 //
 // 为什么不用 miniflare：
 // miniflare 是 wrangler 的内部运行时，它的 Node API（options schema）跨版本
@@ -14,7 +14,7 @@
 import { spawn } from "node:child_process";
 import { writeFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, relative } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -46,6 +46,43 @@ const workerdBin = process.env.WORKERD_BIN || "workerd";
 // 否则 workerd 会把 \U 之类当成非法转义序列直接报错。
 const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
+// ---- embed 路径必须用「相对路径」！这是踩过的坑 ----
+//
+// capnp 的 embed 对以 "/" 开头的路径**不当文件系统绝对路径**处理。
+// 看 capnp 编译器源码 module-loader.c++ 里的 embedRelative()：
+//
+//   if (embedPath[0] == '/') {
+//     return loader.readEmbedFromSearchPath(Path::parse(embedPath.slice(1)));
+//     //     ^^^ 走 -I 搜索路径（workerd 自带的 builtin 目录），不是文件系统根！
+//   } else {
+//     return loader.readEmbed(sourceDir, path.parent().eval(embedPath));
+//     //     ^^^ 相对 capnp 文件所在目录解析
+//   }
+//
+// 所以 `embed "/app/worker.js"` 会被理解成「在搜索路径下找 app/worker.js」，
+// 找不到就报：Couldn't read file for embed: /app/worker.js
+//
+// 正确做法：用相对于 capnp 文件所在目录的相对路径。
+// capnp 就生成在 __dirname 下，bundle 也在 __dirname 下，所以算出来通常是
+// "worker.js"。这里用 relative() 算，兼容 ENTRY_MODULE 指向子目录的情况。
+const capnpPath = resolve(__dirname, "workerd.generated.capnp");
+
+let embedPath = relative(__dirname, modulePath);
+// Windows 下 relative() 返回反斜杠，而 embed 要的是 POSIX 风格分隔符。
+// （容器里都是 Linux，但本机调试时要注意）
+embedPath = embedPath.split("\\").join("/");
+
+// 兜底：万一 bundle 不在 capnp 同级目录下（比如上级目录），relative()
+// 会产出 "../xxx"。capnp 不允许路径逃出当前目录，这种情况直接报错说清楚，
+// 而不是等 workerd 吐一句难懂的 capnp 报错。
+if (embedPath.startsWith("..") || embedPath.startsWith("/")) {
+  console.error(`[server] bundle 与 capnp 不同目录，capnp 的 embed 不支持跨目录：`);
+  console.error(`[server]   capnp 位置: ${capnpPath}`);
+  console.error(`[server]   bundle 位置: ${modulePath}`);
+  console.error(`[server] 请把 ENTRY_MODULE 指向 ${__dirname} 下的文件。`);
+  process.exit(1);
+}
+
 const flagsLine = COMPAT_FLAGS.length
   ? `        compatibilityFlags = [${COMPAT_FLAGS.map((f) => `"${esc(f)}"`).join(", ")}],\n`
   : "";
@@ -69,7 +106,9 @@ const config :Workerd.Config = (
       worker = (
         modules = [
           ( name = "${esc(ENTRY_MODULE)}",
-            esModule = embed "${esc(modulePath)}" )
+            # embed 用相对路径（相对本 capnp 文件所在目录）。
+            # 不要写成绝对路径 —— 见本文件里关于 embedRelative 的注释。
+            esModule = embed "${esc(embedPath)}" )
         ],
         compatibilityDate = "${esc(COMPAT_DATE)}",
 ${flagsLine}      )
@@ -86,11 +125,10 @@ ${flagsLine}      )
 );
 `;
 
-const capnpPath = resolve(__dirname, "workerd.generated.capnp");
 writeFileSync(capnpPath, capnp, "utf8");
 
 console.log(`[server] capnp   -> ${capnpPath}`);
-console.log(`[server] bundle  -> ${modulePath}`);
+console.log(`[server] bundle  -> ${modulePath}  (embed "${embedPath}")`);
 console.log(`[server] 监听    -> http://${BIND}:${PORT}`);
 console.log(`[server] workerd -> ${workerdBin}`);
 
@@ -132,7 +170,8 @@ child.on("exit", (code, signal) => {
     console.error("     -> workerd 升级后 schema 变更，检查 server.mjs 里的 capnp 模板");
     console.error(`  2. 端口 ${PORT} 已被占用 -> 换 PORT 或释放端口`);
     console.error("  3. bundle 里有未解析的裸导入 -> 重新跑 build.mjs");
-    console.error("  4. 模块路径不可读 -> 确认 worker.js 已 COPY 进镜像");
+    console.error(`  4. embed 读不到文件（Couldn't read file for embed）`);
+    console.error(`     -> 检查 ${modulePath} 是否还在，且 embed 必须是相对路径`);
     console.error("");
   }
   console.log(`[server] workerd 退出 code=${code} signal=${signal}`);
