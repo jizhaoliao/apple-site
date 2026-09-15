@@ -1,0 +1,44 @@
+# ============================================================================
+# docker-compose.yml — 从 GHCR 拉取镜像运行（不本地构建）
+#
+# 用法：
+#   docker compose pull && docker compose up -d
+#
+# 前提：先在 GitHub Actions 里手动触发过构建，镜像已推到 GHCR。
+# ============================================================================
+
+services:
+  wloc-spoofer:
+    # ⚠️ 把下面的 jizhaoliao 换成你的 GitHub 用户名（全小写）。
+    # GHCR 不接受大写仓库名，所以这里必须是小写形式。
+    image: ghcr.io/jizhaoliao/apple-site:latest
+    container_name: wloc-spoofer
+
+    # 每次 up 都检查有没有新镜像；配合 `docker compose pull` 使用
+    pull_policy: always
+
+    ports:
+      # 左边是 NAS 上的端口，冲突就改左边，右边别动
+      - "8787:8787"
+
+    environment:
+      PORT: "8787"
+      # "*" = 监听所有网卡（KJ parseAddress 通配写法，同时覆盖 IPv4/IPv6）。
+      # 别改成 0.0.0.0，那只管 IPv4。
+      BIND: "*"
+      # 与仓库里的 wrangler.jsonc 保持同步
+      COMPATIBILITY_DATE: "2026-08-05"
+
+    # 让容器能解析外网 DNS / 访问 gs-loc.apple.com 等上游
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+
+    restart: unless-stopped
+
+    # 日志轮转：防止长期运行把 NAS 磁盘写满
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
