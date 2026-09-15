@@ -1,0 +1,232 @@
+# ============================================================================
+# 构建 Docker 镜像并推送到 GHCR
+#
+# 触发方式：仅手动（Actions 页面点 "Run workflow"）
+# 目标架构：仅 linux/amd64
+# 目的：绕开「本机没有 Docker」和「NAS 构建慢 / 拉不到基础镜像」
+#
+# 仓库设置前置条件（不配置会 403，见 README）：
+#   Settings → Actions → General → Workflow permissions
+#   选 "Read and write permissions"
+# ============================================================================
+name: Build and push Docker image
+
+on:
+  # 只保留手动触发，不做 push/tag 自动构建
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像标签（留空则用 short SHA）"
+        required: false
+        type: string
+        default: ""
+      no_cache:
+        description: "禁用构建缓存（依赖更新了但缓存没失效时用）"
+        required: false
+        type: boolean
+        default: false
+
+# 同一时间只跑一个构建，避免并发推送同标签互相覆盖
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository 是 "owner/repo" 形式，正好符合 GHCR 的镜像命名要求。
+  # ⚠️ GHCR 不接受大写镜像名。Actions 表达式没有 lowercase 函数，
+  #    所以用 bash 的 ${VAR,,} 转小写后写进 GITHUB_ENV（见 build job 第一步）。
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 先跑测试：测试不过就不构建，坏镜像推不上去
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Run upstream tests
+        # ⚠️ 不要用 `npm test`。
+        #
+        # package.json 里写的是 `node --test 'test/*.test.mjs'`，那个单引号会让
+        # shell 不展开 glob，node 收到字面量字符串，结果是「0 tests, 0 pass」——
+        # 退出码是 0，看起来通过了，实际上一个测试都没跑。用它做门禁等于没有门禁。
+        #
+        # 只跑 parse.test.mjs（22 个断言，全部通过）。
+        #
+        # 不跑 test/wloc-stash-output.test.js：它读 dist/wloc.js，但那个文件
+        # 既不在仓库里、也没有任何构建步骤生成它（package.json 里没有对应脚本，
+        # src/ 下也没有 stash 相关代码）。属于失效测试，跟你这次改动无关。
+        run: node --test test/parse.test.mjs
+
+  # ---------------------------------------------------------------------------
+  # 构建并推送
+  # ---------------------------------------------------------------------------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # 推 GHCR 必需
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 把镜像名转成小写。GHCR 拒收大写，而 github.repository 保留原始大小写。
+      # 当前仓库已是小写，但这样处理能避免以后改仓库名时踩坑。
+      - name: Resolve lowercase image name
+        run: echo "IMAGE_NAME_LOWER=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # 只要 amd64，不需要 QEMU（QEMU 是多架构模拟才需要的，会慢好几倍）
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN 是 Actions 自动注入的，不需要自己建 secret
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # GHCR 不接受大写镜像名，而 github.repository 会原样返回仓库名的大小写。
+          # 这里虽然当前仓库是全小写，但显式转小写更稳妥 —— 万一以后改成了
+          # 含大写的仓库名，构建会在推送阶段才报错，排查起来很绕。
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}
+          tags: |
+            # 手动输入的 tag 优先（留空则自动跳过这条）
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            # 始终打一个 latest
+            type=raw,value=latest
+            # 再打一个 short SHA，方便回退到具体某次构建
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # 只构建 amd64。前面确认过 NAS 是 x86_64。
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions 缓存：第二次构建快很多，且不占仓库体积
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          no-cache: ${{ inputs.no_cache }}
+
+      # -----------------------------------------------------------------------
+      # 构建完自检：把镜像拉下来实跑一次，确认真的能起来
+      # -----------------------------------------------------------------------
+      # 光"构建成功"不代表镜像能用 —— workerd 起不来、capnp 写错这类问题
+      # 只有真正运行才会暴露。所以在 CI 里跑一遍冒烟测试，避免把坏镜像
+      # 推到 NAS 上才发现。
+      - name: Smoke test the built image
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:latest"
+          echo "拉取刚推送的镜像: $IMAGE"
+          docker pull "$IMAGE"
+
+          echo "启动容器..."
+          docker run -d --name smoke -p 8787:8787 "$IMAGE"
+
+          # 轮询等待就绪（workerd 绑定端口需要一两秒）
+          echo "等待服务就绪..."
+          OK=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/ >/dev/null 2>&1; then
+              OK=1
+              echo "服务已就绪（第 ${i} 次尝试）"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$OK" != "1" ]; then
+            echo "::error::服务在 30 秒内未就绪，容器日志如下："
+            docker logs smoke
+            docker rm -f smoke || true
+            exit 1
+          fi
+
+          # 断言 1: 首页返回正确内容
+          echo "--- 检查首页 ---"
+          HOME_BODY="$(curl -fsS http://127.0.0.1:8787/)"
+          echo "$HOME_BODY" | grep -q "WLOC" || {
+            echo "::error::首页内容不含 WLOC，页面可能没正常渲染"
+            exit 1
+          }
+          echo "首页 OK（${#HOME_BODY} 字节）"
+
+          # 断言 2: 坐标解析接口 + GCJ-02→WGS84 换算
+          # 传 39.9042,116.4074 应得到 lat=39.902796（约 110 米偏移）。
+          # 校验具体数值而不是只看 200 —— 这样能证明换算逻辑真的在跑，
+          # 而不只是"接口没崩"。
+          echo "--- 检查 /api/parse 坐标换算 ---"
+          RESULT="$(curl -fsS "http://127.0.0.1:8787/api/parse?format=json&u=https%3A%2F%2Fmaps.apple.com%2F%3Fll%3D39.9042%2C116.4074%26name%3DTiananmen")"
+          echo "返回: $RESULT"
+
+          echo "$RESULT" | grep -q '"lat":39.902796' || {
+            echo "::error::坐标换算结果不符合预期（应含 lat:39.902796）"
+            exit 1
+          }
+          echo "坐标换算 OK"
+
+          # 断言 3: 页面里的 Leaflet CDN 引用完好（确认 page.js 没被压坏）
+          echo "--- 检查页面依赖 ---"
+          echo "$HOME_BODY" | grep -q "leaflet" || {
+            echo "::error::页面里找不到 leaflet 引用"
+            exit 1
+          }
+          echo "页面依赖 OK"
+
+          # 收尾：清理容器和日志
+          echo "--- 冒烟测试通过，清理 ---"
+          docker logs smoke
+          docker rm -f smoke
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Docker 构建结果"
+            echo ""
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "✅ 构建 + 推送 + 冒烟测试全部通过"
+            else
+              echo "❌ 失败，请看上方日志"
+            fi
+            echo ""
+            echo "**镜像地址：**"
+            echo '```'
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}"
+            echo '```'
+            echo "**标签：**"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "**在 NAS 上拉取：**"
+            echo '```bash'
+            echo "docker pull ${{ env.REGISTRY }}/${{ github.repository }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
