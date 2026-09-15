@@ -1,0 +1,14 @@
+# 防止 Windows 的 core.autocrlf 把 LF 转成 CRLF 破坏脚本。
+# 症状：#!/usr/bin/env sh\r -> "/bin/sh^M: bad interpreter"
+
+# 必须 LF
+*.sh    text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# 注意：不要写 `* text=auto`，那会对未知后缀做文本探测，有误判二进制的风险。
