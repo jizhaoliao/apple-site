@@ -24,8 +24,13 @@ COPY package.json package-lock.json* ./
 RUN npm install --no-audit --no-fund \
  && npm install --no-save --no-audit --no-fund esbuild@^0.25.0
 
-# 构建脚本
-COPY docker/build.mjs ./
+# 构建脚本。
+# ⚠️ 必须保持 docker/ 这一层目录结构，不能拍平成 ./build.mjs。
+# 原因有两个：
+#   1) 下面的执行命令是 `node docker/build.mjs`，路径要能对上
+#   2) build.mjs 内部用 `resolve(__dirname, "..")` 推算仓库根目录
+#      （因为它假定自己在 <仓库根>/docker/ 下），拍平会让它算错路径
+COPY docker/ ./docker/
 
 # 上游源码（只用 src/，其余与自托管无关）
 COPY src/ ./src/
